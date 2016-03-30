@@ -64,10 +64,11 @@ fbsObject.ignore( fbsComment )
 
 """The value type of a C++ member"""
 class ValueType():
-    def __init__(self, type, size, is_zerobuf_type=False, is_byte_type=False):
+    def __init__(self, type, size, is_zerobuf_type=False, is_enum_type=False, is_byte_type=False):
         self.type = type
         self.size = size
         self.is_zerobuf_type = is_zerobuf_type
+        self.is_enum_type = is_enum_type
         self.is_byte_type = is_byte_type
         self.is_string = (type == "char*")
         if self.is_string:
@@ -75,28 +76,42 @@ class ValueType():
             self.size = 1
 
     def get_data_type(self):
-        return "uint32_t" if self.is_zerobuf_type else self.type
+        return "uint32_t" if self.is_zerobuf_type or self.is_enum_type else self.type
 
 
 """A C++ Function"""
 class Function():
-    def __init__(self, ret_val, function, body, static=False, explicit=False, virtual=False):
+    def __init__(self, ret_val, function, body, static=False, explicit=False, virtual=False, split=True):
         self.ret_val = ret_val
         self.function = function
         self.body = body
         self.static = "static " if static else ""
         self.explicit = "explicit " if explicit else ""
         self.virtual = "virtual " if virtual else ""
+        self.split_implementation = split
+
+    def get_declaration(self):
+        if self.ret_val:
+            return "{0}{1} {2} {{ {3} }}".format( self.static, self.ret_val, self.function, self.body )
+        # ctor '[initializer list]{ body }'
+        return "{0}{1}{2} {3}".format( self.virtual, self.explicit, self.function, self.body )
+
+    def get_definition(self):
+        if self.ret_val:
+            return "{0}{1} {2};".format( self.static, self.ret_val, self.function, self.body )
+        # ctor '[initializer list]{ body }'
+        return "{0}{1}{2};".format( self.virtual, self.explicit, self.function )
 
     def write_declaration(self, file):
-        if self.ret_val: # '{}'-less body
-            file.write( "    {0}{1} {2};\n".
-                          format( self.static, self.ret_val, self.function ))
-        else:      # ctor '[initializer list]{ body }'
-            file.write( "    {0}{1}{2};\n".
-                          format( self.virtual, self.explicit, self.function ))
+        if self.split_implementation:
+            file.write( "    {0}\n".format(self.get_definition()))
+        else:
+            file.write( "    {0}\n".format(self.get_declaration()))
 
     def write_implementation(self, file, classname):
+        if not self.split_implementation:
+            return
+
         impl_function = re.sub(r" final$", "", self.function) # remove ' final' keyword
         impl_function = re.sub(r" = [0-9\.f]+ ", " ", impl_function) # remove default params
 
@@ -111,21 +126,20 @@ class Function():
 
 """A member of a C++ class"""
 class ClassMember():
-    def __init__(self, name, value_type, allocator_offset):
+    def __init__(self, name, value_type):
         assert(isinstance(value_type, ValueType))
         self.cxxname = name
         self.cxxName = name[0].upper() + str(name[1:])
         self.value_type = value_type
-        self.allocator_offset = allocator_offset
-        self.functions = []
+        self.allocator_offset = 0
 
     def write_accessors_declaration(self, file):
-        for function in self.functions:
+        for function in self.get_accessor_functions():
             function.write_declaration(file)
         file.write("\n")
 
-    def write_implementation(self, file, classname):
-        for function in self.functions:
+    def write_accessors_implementation(self, file, classname):
+        for function in self.get_accessor_functions():
             function.write_implementation(file, classname)
         file.write("\n")
 
@@ -135,29 +149,32 @@ class ClassMember():
 
 """A member of a class which has a fixed size (such as a POD type)"""
 class FixedSizeMember(ClassMember):
-    def __init__(self, name, type, allocator_offset):
-        super(FixedSizeMember, self).__init__(name, type, allocator_offset)
+    def __init__(self, name, type):
+        super(FixedSizeMember, self).__init__(name, type)
 
+    def get_accessor_functions(self):
+        functions = []
         if self.value_type.is_zerobuf_type:
-            self.functions.append(Function( "const {0}&".format( self.value_type.type ),
+            functions.append(Function( "const {0}&".format( self.value_type.type ),
                           "get" + self.cxxName + "() const",
                           "return _{0};".format( self.cxxname )))
-            self.functions.append(Function( "{0}&".format( self.value_type.type ), "get" + self.cxxName + "()",
+            functions.append(Function( "{0}&".format( self.value_type.type ), "get" + self.cxxName + "()",
                           "notifyChanging();\n    " +
                           "return _{0};".format( self.cxxname )))
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                           "set"  + self.cxxName + "( const " + self.value_type.type + "& value )",
                           "notifyChanging();\n    " +
                           "_{0} = value;".format( self.cxxname )))
         else:
-            self.functions.append(Function(self.value_type.type, "get" + self.cxxName + "() const",
+            functions.append(Function(self.value_type.type, "get" + self.cxxName + "() const",
                           "return getAllocator().template getItem< " + self.value_type.type +
-                          " >( " + str( allocator_offset ) + " );" ))
-            self.functions.append(Function( "void",
+                          " >( " + str( self.allocator_offset ) + " );" ))
+            functions.append(Function( "void",
                           "set{0}( {1} value )".format(self.cxxName, self.value_type.type),
                           "notifyChanging();\n    " +
                           "getAllocator().template getItem< {0} >( {1} ) = value;".\
-                          format(self.value_type.type, allocator_offset)))
+                          format(self.value_type.type, self.allocator_offset)))
+        return functions
 
     def get_byte_size(self):
         return self.value_type.size
@@ -182,10 +199,11 @@ class FixedSizeMember(ClassMember):
 
 
 """A member of a class which is a fixed size array"""
-class FixedSizeMemberArray(ClassMember):
-    def __init__(self, name, type, elem_count, classname, allocator_offset):
-        super(FixedSizeMemberArray, self).__init__(name, type, allocator_offset)
+class FixedSizeArray(ClassMember):
+    def __init__(self, name, type, elem_count, classname):
+        super(FixedSizeArray, self).__init__(name, type)
         self.nElems = elem_count
+        self.classname = classname
 
         if self.nElems < 2:
             sys.exit( "Static array of size {0} for field {1} not supported".
@@ -193,67 +211,70 @@ class FixedSizeMemberArray(ClassMember):
         if self.value_type.size == 0:
             sys.exit( "Static array of {0} dynamic elements not implemented".
                       format(self.nElems))
-
         if self.value_type.is_zerobuf_type:
             if self.value_type.size == 0:
                 sys.exit("Static arrays of empty ZeroBuf (field {0}) not supported".format(self.cxxname))
 
-            self.functions.append(Function( "const {0}::{1}&".format( classname, self.cxxName ),
+    def get_accessor_functions(self):
+        functions = []
+        if self.value_type.is_zerobuf_type:
+            functions.append(Function( "const {0}::{1}&".format( self.classname, self.cxxName ),
                           "get" + self.cxxName + "() const",
                           "return _{0};".format( self.cxxname )))
-            self.functions.append(Function( "{0}::{1}&".format( classname, self.cxxName ),
+            functions.append(Function( "{0}::{1}&".format( self.classname, self.cxxName ),
                           "get" + self.cxxName + "()",
                           "notifyChanging();\n    " +
                           "return _{0};".format( self.cxxname )))
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                           "set{0}( const {0}& value )".format( self.cxxName ),
                           "notifyChanging();\n    " +
                           "_{0} = value;".format( self.cxxname )))
         else:
-            self.functions.append(Function( self.value_type.type + "*", "get" + self.cxxName + "()",
+            functions.append(Function( self.value_type.type + "*", "get" + self.cxxName + "()",
                           "notifyChanging();\n    " +
                           "return getAllocator().template getItemPtr< " + self.value_type.type +
-                          " >( " + str( allocator_offset ) + " );" ))
-            self.functions.append(Function( "const " + self.value_type.type + "*",
+                          " >( " + str( self.allocator_offset ) + " );" ))
+            functions.append(Function( "const " + self.value_type.type + "*",
                           "get" + self.cxxName + "() const",
                           "return getAllocator().template getItemPtr< " + self.value_type.type +
-                          " >( " + str( allocator_offset ) + " );" ))
-            self.functions.append(Function( "std::vector< " + self.value_type.type + " >",
+                          " >( " + str( self.allocator_offset ) + " );" ))
+            functions.append(Function( "std::vector< " + self.value_type.type + " >",
                           "get" + self.cxxName + "Vector() const",
                           "const " + self.value_type.type + "* ptr = getAllocator().template " +
-                          "getItemPtr< " + self.value_type.type + " >( " + str( allocator_offset ) +
+                          "getItemPtr< " + self.value_type.type + " >( " + str( self.allocator_offset ) +
                           " );\n    return std::vector< " + self.value_type.type +
                           " >( ptr, ptr + " + str( self.nElems ) + " );" ))
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                           "set"  + self.cxxName + "( " + self.value_type.type + " value[ " +
                           str(self.nElems) + " ] )",
                           "notifyChanging();\n    " +
                           "::memcpy( getAllocator().template getItemPtr< " +
-                          self.value_type.type + " >( " + str( allocator_offset ) + " ), value, " +
+                          self.value_type.type + " >( " + str( self.allocator_offset ) + " ), value, " +
                           str( self.nElems ) + " * sizeof( " + self.value_type.type + " ));" ))
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                           "set" + self.cxxName + "( const std::vector< " +
                           self.value_type.type + " >& value )",
                           "if( " + str( self.nElems ) + " >= value.size( ))\n" +
                           "    {\n" +
                           "        notifyChanging();" +
                           "        ::memcpy( getAllocator().template getItemPtr<" +
-                          self.value_type.type + ">( " + str( allocator_offset ) +
+                          self.value_type.type + ">( " + str( self.allocator_offset ) +
                           " ), value.data(), value.size() * sizeof( " + self.value_type.type +
                           "));\n" +
                           "    }" ))
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                           "set" + self.cxxName + "( const std::string& value )",
                           "if( " + str(self.get_byte_size()) + " >= value.length( ))\n" +
                           "    {\n" +
                           "        notifyChanging();\n" +
                           "        ::memcpy( getAllocator().template getItemPtr<" +
-                          self.value_type.type + ">( " + str( allocator_offset ) +
+                          self.value_type.type + ">( " + str( self.allocator_offset ) +
                           " ), value.data(), value.length( ));\n" +
                           "    }" ))
 
-        self.functions.append(Function( "size_t", "get" + self.cxxName + "Size() const",
+        functions.append(Function( "size_t", "get" + self.cxxName + "Size() const",
                       "return {0};".format(self.nElems)))
+        return functions
 
     def get_byte_size(self):
         return self.value_type.size * self.nElems
@@ -277,7 +298,7 @@ class FixedSizeMemberArray(ClassMember):
         fromJSON = "    {\n"
         fromJSON += "        const Json::Value& field = ::zerobuf::getJSONField( json, \"{0}\" );\n".format(self.cxxname)
 
-        if self.value_type.is_zerobuf_type:
+        if self.value_type.is_zerobuf_type and not self.value_type.is_enum_type:
             for i in range(0, self.nElems):
                 fromJSON += "        ::zerobuf::fromJSON( ::zerobuf::getJSONField( field, {1} ), _{0}[{1}] );\n".format(self.cxxname, i)
         else:
@@ -298,7 +319,7 @@ class FixedSizeMemberArray(ClassMember):
         toJSON = "    {\n"
         toJSON += "        Json::Value& field = ::zerobuf::getJSONField( json, \"{0}\" );\n".format(self.cxxname)
 
-        if self.value_type.is_zerobuf_type:
+        if self.value_type.is_zerobuf_type and not self.value_type.is_enum_type:
             for i in range(0, self.nElems):
                 toJSON += "        ::zerobuf::toJSON( static_cast< const ::zerobuf::Zerobuf& >( _{0}[{1}] ), ::zerobuf::getJSONField( field, {1} ));\n".format(self.cxxname, i)
         else:
@@ -316,16 +337,19 @@ class FixedSizeMemberArray(ClassMember):
 
 """A member of a class which has a dynamic size and is a ZeroBuf type"""
 class DynamicZeroBufMember(ClassMember):
-    def __init__(self, name, type, dynamic_type_index, allocator_offset):
-        super(DynamicZeroBufMember,self).__init__(name, type, allocator_offset)
+    def __init__(self, name, type, dynamic_type_index):
+        super(DynamicZeroBufMember,self).__init__(name, type)
         self.dynamic_type_index = dynamic_type_index
 
-        self.functions.append(Function("{0}&".format(self.value_type.type), "get{0}()".format(self.cxxName),
+    def get_accessor_functions(self):
+        functions = []
+        functions.append(Function("{0}&".format(self.value_type.type), "get{0}()".format(self.cxxName),
                                    "notifyChanging();\n    return _{0};".format(self.cxxname)))
-        self.functions.append(Function("const {0}&".format(self.value_type.type), "get{0}() const".format(self.cxxName),
+        functions.append(Function("const {0}&".format(self.value_type.type), "get{0}() const".format(self.cxxName),
                                    "return _{0};".format(self.cxxname)))
-        self.functions.append(Function("void", "set{0}( const {1}& value )".format(self.cxxName, self.value_type.type),
+        functions.append(Function("void", "set{0}( const {1}& value )".format(self.cxxName, self.value_type.type),
                                    "notifyChanging();\n    _{0} = value;".format(self.cxxname)))
+        return functions
 
     def get_byte_size(self):
         return 16 # 8b offset, 8b size
@@ -343,26 +367,29 @@ class DynamicZeroBufMember(ClassMember):
         return "    ::zerobuf::toJSON( static_cast< const ::zerobuf::Zerobuf& >( _{0} ), ::zerobuf::getJSONField( json, \"{0}\" ));\n".format(self.cxxname)
 
 
-"""A member of a class which has a dynamic size (vector type)"""
+"""A member of a class which has a dynamic size (vector or string type)"""
 class DynamicMember(ClassMember):
-    def __init__(self, name, type, dynamic_type_index, classname, allocator_offset):
-        super(DynamicMember, self).__init__(name, type, allocator_offset)
+    def __init__(self, name, type, dynamic_type_index, classname):
+        super(DynamicMember, self).__init__(name, type)
         self.dynamic_type_index = dynamic_type_index
-
-        self.functions = []
-        self.functions.append(Function( "{0}::{1}&".format( classname, self.cxxName ),
-                                        "get" + self.cxxName + "()",
-                                        "notifyChanging();\n    " +
-                                        "return _{0};".format( self.cxxname )))
-        self.functions.append(Function( "const {0}::{1}&".format( classname, self.cxxName ),
-                                        "get" + self.cxxName + "() const",
-                                        "return _{0};".format( self.cxxname )))
+        self.classname = classname
 
         if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
             if self.value_type.size == 0:
                 sys.exit("Dynamic arrays of empty ZeroBuf (field {0}) not supported".format(self.cxxname))
 
-            self.functions.append(Function( "std::vector< " + self.value_type.type + " >",
+    def get_accessor_functions(self):
+        functions = []
+        functions.append(Function( "{0}::{1}&".format( self.classname, self.cxxName ),
+                                        "get" + self.cxxName + "()",
+                                        "notifyChanging();\n    " +
+                                        "return _{0};".format( self.cxxname )))
+        functions.append(Function( "const {0}::{1}&".format( self.classname, self.cxxName ),
+                                        "get" + self.cxxName + "() const",
+                                        "return _{0};".format( self.cxxname )))
+
+        if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
+            functions.append(Function( "std::vector< " + self.value_type.type + " >",
                                             "get" + self.cxxName + "Vector() const",
                                             "const {0}& vec = get{0}();\n".format( self.cxxName ) +
                                             "    std::vector< " + self.value_type.type + " > ret;\n" +
@@ -370,44 +397,47 @@ class DynamicMember(ClassMember):
                                             "    for( size_t i = 0; i < vec.size(); ++i )\n" +
                                             "        ret.push_back( vec[i] );\n" +
                                             "    return ret;\n" ))
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                                             "set" + self.cxxName + "( const std::vector< " +
                                             self.value_type.type + " >& values )",
                                             "notifyChanging();\n    " +
-                                            "::zerobuf::Vector< {0} > dynamic( getAllocator(), {1} );\n".format(self.value_type.type, self.dynamic_type_index) +
+                                            "::zerobuf::Vector< {0} > dynamic( getAllocator(), {1} );\n". \
+                                            format(self.value_type.type, self.dynamic_type_index) +
                                             "    dynamic.clear();\n" +
                                             "    for( const " + self.value_type.type + "& data : values )\n" +
                                             "        dynamic.push_back( data );" ))
 
         else: # Dynamic array of PODs
-            self.functions.append(Function( "void",
+            functions.append(Function( "void",
                                             "set{0}( {1} const * value, size_t size )". \
                                             format(self.cxxName, self.value_type.type),
                                             "notifyChanging();\n    " +
                                             "_copyZerobufArray( value, size * sizeof( " + self.value_type.type +
                                             " ), " + str( self.dynamic_type_index ) + " );" ))
-            self.functions.append(Function( "std::vector< " + self.value_type.type + " >",
+            functions.append(Function( "std::vector< " + self.value_type.type + " >",
                                             "get" + self.cxxName + "Vector() const",
-                                            "return std::vector< {0} >( _{1}.data(), _{1}.data() + _{1}.size( ));".format(self.value_type.type, self.cxxname)))
-            self.functions.append(Function( "void",
+                                            "return std::vector< {0} >( _{1}.data(), _{1}.data() + _{1}.size( ));". \
+                                            format(self.value_type.type, self.cxxname)))
+            functions.append(Function( "void",
                                             "set" + self.cxxName + "( const std::vector< " +
                                             self.value_type.type + " >& value )",
                                             "notifyChanging();\n    " +
                                             "_copyZerobufArray( value.data(), value.size() * sizeof( " +
                                             self.value_type.type + " ), " + str( self.dynamic_type_index ) + " );" ))
             # string
-            self.functions.append(Function( "std::string",
+            functions.append(Function( "std::string",
                                             "get" + self.cxxName + "String() const",
                                             "const uint8_t* ptr = getAllocator().template getDynamic< " +
                                             "const uint8_t >( " + str( self.dynamic_type_index ) + " );\n" +
                                             "    return std::string( ptr, ptr + " +
                                             "getAllocator().template getItem< uint64_t >( " +
-                                            str( allocator_offset + 8 ) + " ));" ))
-            self.functions.append(Function( "void",
+                                            str( self.allocator_offset + 8 ) + " ));" ))
+            functions.append(Function( "void",
                                             "set" + self.cxxName + "( const std::string& value )",
                                             "notifyChanging();\n    " +
                                             "_copyZerobufArray( value.c_str(), value.length(), " +
                                             str( self.dynamic_type_index ) + " );" ))
+        return functions
 
     def get_byte_size(self):
         return 16 # 8b offset, 8b size
@@ -463,19 +493,32 @@ class FbsTable():
         self.name = item[1]
         self.attributes = item[2:]
         self.namespace = namespace
-        self.offset = 4 # 4b version header in host endianness
+        self.offset = 0
         self.dynamic_members = []
         self.static_members = []
         self.zerobuf_types = set()
         self.functions = []
         self.initializers = []
-        self.default_values = ""
-
+        self.default_value_setters = ""
         self.md5 = hashlib.md5()
-        for namespace in self.namespace:
-            self.md5.update(namespace.encode('utf-8') + b"::")
-        self.md5.update(self.name.encode('utf-8'))
 
+        self.parse_members(fbsFile)
+        self.compute_offsets()
+        self.compute_md5()
+        self.fill_initializer_list()
+
+        if len(self.dynamic_members) > 0:
+            self.functions.append(self.get_compact_function())
+
+        if self.offset == 0: # OPT: table has no data
+            self.add_empty_constructors()
+        else:
+            self.add_special_member_functions(fbsFile)
+
+        self.add_introspection_functions()
+        self.add_json_functions()
+
+    def parse_members(self, fbsFile):
         dynamic_type_index = 0
         for spec in self.attributes:
             name = spec[0]
@@ -483,113 +526,129 @@ class FbsTable():
             cxxtype = fbsFile.types[fbs_type][1]
             cxxtype_size = fbsFile.types[fbs_type][0]
             is_zerobuf_type = cxxtype in fbsFile.table_names
+            is_enum_type = cxxtype in fbsFile.enum_names
             is_byte_type = fbs_type == "byte" or fbs_type == "ubyte"
-            value_type = ValueType(cxxtype, cxxtype_size, is_zerobuf_type, is_byte_type)
+            value_type = ValueType(cxxtype, cxxtype_size, is_zerobuf_type, is_enum_type, is_byte_type)
 
             if self.is_dynamic(spec, fbsFile):
                 if len(spec) == 2 and is_zerobuf_type:
-                    member = DynamicZeroBufMember(name, value_type, dynamic_type_index, self.offset)
+                    member = DynamicZeroBufMember(name, value_type, dynamic_type_index)
                 else:
-                    member = DynamicMember(name, value_type, dynamic_type_index, self.name, self.offset)
+                    member = DynamicMember(name, value_type, dynamic_type_index, self.name)
                 dynamic_type_index += 1
                 self.dynamic_members.append(member)
             else:
                 if len(spec) == 2 or len(spec) == 3:
-                    member = FixedSizeMember(name, value_type, self.offset)
+                    member = FixedSizeMember(name, value_type)
                     if len(spec) == 3:
                         default_values = spec[2]
-                        self.default_values += "    set{0}({1}( {2} ));\n". \
+                        self.default_value_setters += "    set{0}({1}( {2} ));\n". \
                             format(member.cxxName, cxxtype, default_values)
                 else:
                     elem_count = int(spec[4])
-                    member = FixedSizeMemberArray(name, value_type, elem_count, self.name, self.offset)
+                    member = FixedSizeArray(name, value_type, elem_count, self.name)
                 self.static_members.append(member)
 
+    def compute_offsets(self):
+        self.offset = 4 # 4b version header in host endianness
+        for member in self.dynamic_members:
+            member.allocator_offset = self.offset
             self.offset += member.get_byte_size()
-            self.md5.update(member.get_unique_identifier())
-
-        self.fill_initializer_list()
-
-        if len(self.dynamic_members) > 0:
-            self.functions.append(self.get_compact_function())
-
+        for member in self.static_members:
+            member.allocator_offset = self.offset
+            self.offset += member.get_byte_size()
         if self.offset == 4: # OPT: table has no data
             self.offset = 0
-            self.functions.append(Function(None, "{0}()".format( self.name ),
-                         ": ::zerobuf::Zerobuf( ::zerobuf::AllocatorPtr( )){}"))
-            self.functions.append(Function(None,
-                         "{0}( const {0}& )".format( self.name ),
-                         ": ::zerobuf::Zerobuf( ::zerobuf::AllocatorPtr( )){}"))
-        else:
-            # default ctor
-            self.functions.append(Function(None, "{0}()".format(self.name),
-                         ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n{{}}".format(self.name, self.offset, len(self.dynamic_members))))
 
-            # member initialization ctor
-            memberArgs = []
-            initializers = ''
-            for spec in self.attributes:
-                cxxname = spec[0]
-                cxxName = cxxname[0].upper() + cxxname[1:]
-                cxxtype = self.get_cxxtype(spec, fbsFile)
-                valueName = cxxname + 'Value'
-                memberArgs.append("const {0}& {1}".format(cxxtype, valueName))
-                initializers += "    set{0}( {1} );\n".format(cxxName, valueName)
-            self.functions.append(Function( None,
-                          "{0}( {1} )".format(self.name, ', '.join(memberArgs)),
-                          ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n"
-                          "{{\n{3}}}".format(self.name, self.offset, len(self.dynamic_members), initializers)))
+    def compute_md5(self):
+        for namespace in self.namespace:
+            self.md5.update(namespace.encode('utf-8') + b"::")
+        self.md5.update(self.name.encode('utf-8'))
+        for member in self.dynamic_members:
+            self.md5.update(member.get_unique_identifier())
+        for member in self.static_members:
+            self.md5.update(member.get_unique_identifier())
 
-            # copy ctor
-            self.functions.append(Function(None,
-                         "{0}( const {0}& rhs )".format(self.name),
-                         ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n".format(self.name, self.offset, len(self.dynamic_members)) +
-                         "{\n    *this = rhs;\n}"))
+    def add_virtual_destructor(self):
+        self.functions.append(Function(None, "~" + self.name + "()", "{}",
+                                       virtual=True, split=False))
 
-            # move ctor
-            self.functions.append(Function(None,
-                         "{0}( {0}&& rhs ) throw()".format(self.name),
-                         ": ::zerobuf::Zerobuf( std::move( rhs ))\n" +
-                         self.get_move_initializer()))
+    def add_empty_constructors(self):
+        self.functions.append(Function(None, "{0}()".format( self.name ),
+                                       ": ::zerobuf::Zerobuf( ::zerobuf::AllocatorPtr( )){}"))
+        self.functions.append(Function(None,
+                                       "{0}( const {0}& )".format( self.name ),
+                                       ": ::zerobuf::Zerobuf( ::zerobuf::AllocatorPtr( )){}"))
+        self.add_virtual_destructor()
+        self.functions.append(Function(self.name+"&",
+                                       "operator = ( const " + self.name + "& )",
+                                       "return *this;",
+                                       split=False))
 
-            # copy-from-baseclass ctor
-            self.functions.append(Function(None,
-                         "{0}( const ::zerobuf::Zerobuf& rhs )".format(self.name),
-                         ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n".format(self.name, self.offset, len(self.dynamic_members)) +
-                         "{\n" +
-                         "    ::zerobuf::Zerobuf::operator = ( rhs );\n" +
-                         "}"))
+    def add_special_member_functions(self, fbsFile):
+        # default ctor
+        self.functions.append(Function(None, "{0}()".format(self.name),
+                                       ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n{{}}". \
+                                       format(self.name, self.offset, len(self.dynamic_members))))
 
-            # Zerobuf object owns allocator!
-            self.functions.append(Function(None,
-                         "{0}( ::zerobuf::AllocatorPtr allocator )".format( self.name ),
-                         ": ::zerobuf::Zerobuf( std::move( allocator ))\n{0}".format(self.get_initializer_list()) +
-                         "{{\n{3}}}".format(self.name, self.offset, len(self.dynamic_members), self.default_values),
-                         explicit = True))
+        # member initialization ctor
+        memberArgs = []
+        initializers = ''
+        for spec in self.attributes:
+            cxxname = spec[0]
+            cxxName = cxxname[0].upper() + cxxname[1:]
+            cxxtype = self.get_cxxtype(spec, fbsFile)
+            valueName = cxxname + 'Value'
+            memberArgs.append("const {0}& {1}".format(cxxtype, valueName))
+            initializers += "    set{0}( {1} );\n".format(cxxName, valueName)
+        self.functions.append(Function( None,
+                                        "{0}( {1} )".format(self.name, ', '.join(memberArgs)),
+                                        ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n"
+                                        "{{\n{3}}}".format(self.name, self.offset, len(self.dynamic_members), initializers)))
 
-            # ctors, dtor and assignment operator
-            self.functions.append(Function(None, "~" + self.name + "()", "{}", virtual=True))
-            if self.offset == 0: # OPT: table has no data
-                self.functions.append(Function(self.name+"&",
-                                               "operator = ( const " + self.name + "& )",
-                                               "{ return *this; }"))
-            else:
-                self.functions.append(Function(self.name+"&",
-                                               "operator = ( const " + self.name + "& rhs )",
-                                               "::zerobuf::Zerobuf::operator = ( rhs );\n" +
-                                               "    return *this;"))
+        # copy ctor
+        self.functions.append(Function(None,
+                                       "{0}( const {0}& rhs )".format(self.name),
+                                       ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n". \
+                                       format(self.name, self.offset, len(self.dynamic_members)) +
+                                       "{\n    *this = rhs;\n}"))
 
-            self.functions.append(Function("{0}&".format(self.name),
-                         "operator = ( {0}&& rhs )".format(self.name),
-                         "::zerobuf::Zerobuf::operator = ( std::move( rhs ));\n" +
-                         self.get_move_operator() +
-                         "    return *this;"))
+        # move ctor
+        self.functions.append(Function(None,
+                                       "{0}( {0}&& rhs ) throw()".format(self.name),
+                                       ": ::zerobuf::Zerobuf( std::move( rhs ))\n" +
+                                       self.get_move_initializer()))
 
-        # Introspection
-        self.add_introspection_functions()
+        # copy-from-baseclass ctor
+        self.functions.append(Function(None,
+                                       "{0}( const ::zerobuf::Zerobuf& rhs )".format(self.name),
+                                       ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n". \
+                                       format(self.name, self.offset, len(self.dynamic_members)) +
+                                       "{\n" +
+                                       "    ::zerobuf::Zerobuf::operator = ( rhs );\n" +
+                                       "}"))
 
-        # JSON
-        self.add_json_functions()
+        # Zerobuf object owns allocator!
+        self.functions.append(Function(None,
+                                       "{0}( ::zerobuf::AllocatorPtr allocator )".format( self.name ),
+                                       ": ::zerobuf::Zerobuf( std::move( allocator ))\n{0}".format(self.get_initializer_list()) +
+                                       "{{\n{3}}}".format(self.name, self.offset, len(self.dynamic_members), self.default_value_setters),
+                                       explicit = True))
+
+        self.add_virtual_destructor()
+
+        # copy ctor and copy assignment operator
+        self.functions.append(Function(self.name+"&",
+                                       "operator = ( const " + self.name + "& rhs )",
+                                       "::zerobuf::Zerobuf::operator = ( rhs ); return *this;",
+                                       split=False))
+
+        self.functions.append(Function("{0}&".format(self.name),
+                                       "operator = ( {0}&& rhs )".format(self.name),
+                                       "::zerobuf::Zerobuf::operator = ( std::move( rhs ));\n" +
+                                       self.get_move_operator() +
+                                       "    return *this;"))
+
 
     def add_introspection_functions(self):
         digest = self.md5.hexdigest()
@@ -601,17 +660,17 @@ class FbsTable():
                                          self.name)
 
         self.functions.append(Function("std::string", "getTypeName() const final",
-                                       "return \"{0}\";".format(zerobufName)))
+                                       "return \"{0}\";".format(zerobufName), split=False))
         self.functions.append(Function("::zerobuf::uint128_t", "getTypeIdentifier() const final",
-                                       "return {0};".format(zerobufType)))
+                                       "return {0};".format(zerobufType), split=False))
         self.functions.append(Function("size_t", "getZerobufStaticSize() const final",
-                                       "return {0};".format(self.offset)))
+                                       "return {0};".format(self.offset), split=False))
         self.functions.append(Function("size_t", "ZEROBUF_STATIC_SIZE()",
-                                       "return {0};".format(self.offset), static=True))
+                                       "return {0};".format(self.offset), static=True, split=False))
         self.functions.append(Function("size_t", "getZerobufNumDynamics() const final",
-                                       "return {0};".format(len(self.dynamic_members))))
+                                       "return {0};".format(len(self.dynamic_members)), split=False))
         self.functions.append(Function("size_t", "ZEROBUF_NUM_DYNAMICS()",
-                                       "return {0};".format(len(self.dynamic_members)), static=True))
+                                       "return {0};".format(len(self.dynamic_members)), static=True, split=False))
 
     def add_json_functions(self):
         from_json = ""
@@ -652,33 +711,35 @@ class FbsTable():
             if fbs_type == "string":
                 cxxtype = "std::string"
             elif(len(spec) == 2 and fbs_type in fbsFile.table_names):
-                # dynamic Zerobuf member
-                cxxtype = fbsFile.types[fbs_type][1]
+                # dynamic Zerobuf member, use the type directly
+                cxxtype = fbs_type
             else:
+                # vector of any type
                 cxxtype = "std::vector< {0} >".format(fbsFile.types[fbs_type][1])
         else:
             if len(spec) == 2 or len(spec) == 3:
                 cxxtype = fbsFile.types[fbs_type][1] # static member
             else:
                 if fbs_type in fbsFile.table_names:
-                    #cxxtype = cxxName # static array of zerobuf
-                    cxxtype = fbs_type # static array of zerobuf
+                    # static array of zerobuf type, use the typedef for the std::array< T >
+                    cxxname = spec[0]
+                    cxxName = cxxname[0].upper() + cxxname[1:]
+                    cxxtype = cxxName
                 else:
-                    cxxtype = "std::vector< {0} >".format(fbsFile.types[fbs_type][1]) # static array of POD
+                    # static array of POD
+                    cxxtype = "std::vector< {0} >".format(fbsFile.types[fbs_type][1])
         return cxxtype
-
-    def get_offset(self):
-        return self.offset if len(self.dynamic_members) == 0 else 0
 
     def write_declaration(self, file):
         self.write_class_begin(file)
 
-        # member accessors
+        # members accessors
         for member in self.dynamic_members:
             member.write_accessors_declaration(file)
         for member in self.static_members:
             member.write_accessors_declaration(file)
 
+        # class functions
         for function in self.functions:
             function.write_declaration(file)
 
@@ -702,11 +763,12 @@ class FbsTable():
         file.write( "\n};\n\n" )
 
     def write_implementation(self, file):
-        # member access
+        # members accessors
         for member in self.dynamic_members:
-            member.write_implementation(file, self.name)
+            member.write_accessors_implementation(file, self.name)
         for member in self.static_members:
-            member.write_implementation(file, self.name)
+            member.write_accessors_implementation(file, self.name)
+        # class functions
         for function in self.functions:
             function.write_implementation(file, self.name)
 
@@ -720,14 +782,11 @@ class FbsTable():
         return Function("void", "compact( float threshold = 0.1f ) final", compact)
 
     def fill_initializer_list(self):
-        # offset = 0
         for member in self.dynamic_members:
             self.initializers.append(member.get_initializer())
-            # offset += member.get_byte_size()
         for member in self.static_members:
             if member.value_type.is_zerobuf_type:
                 self.initializers.append(member.get_initializer())
-            # offset += member.get_byte_size()
 
     def get_move_statics(self):
         movers = ''
@@ -738,17 +797,17 @@ class FbsTable():
                     allocator = "::zerobuf::NonMovingSubAllocator( {{0}}, {0}, {1}::ZEROBUF_NUM_DYNAMICS(), {1}::ZEROBUF_STATIC_SIZE( ))".format(initializer[3], initializer[2])
                 else:
                     allocator = "::zerobuf::StaticSubAllocator( {{0}}, {0}, {1} )".format(initializer[3], initializer[4])
-                movers += "    _{0}.reset( ::zerobuf::AllocatorPtr( new {1}));\n"\
+                movers += "    _{0}.reset( ::zerobuf::AllocatorPtr( new {1}));\n" \
                     .format(initializer[0], allocator ).format( "getAllocator()" )
-                movers += "    rhs._{0}.reset( ::zerobuf::AllocatorPtr( new {1}));\n"\
+                movers += "    rhs._{0}.reset( ::zerobuf::AllocatorPtr( new {1}));\n" \
                     .format(initializer[0], allocator ).format( "rhs.getAllocator()" )
             elif initializer[1] != 0: # static array
                 for i in range(0, initializer[1]):
-                    movers += "    _{0}[{1}].reset( ::zerobuf::AllocatorPtr( "\
-                        "new ::zerobuf::StaticSubAllocator( getAllocator(), {2}, {3} )));\n"\
+                    movers += "    _{0}[{1}].reset( ::zerobuf::AllocatorPtr( " \
+                              "new ::zerobuf::StaticSubAllocator( getAllocator(), {2}, {3} )));\n" \
                         .format(initializer[0], i, initializer[3], initializer[3] + i * initializer[4])
-                    movers += "    rhs._{0}[{1}].reset( ::zerobuf::AllocatorPtr( "\
-                        "new ::zerobuf::StaticSubAllocator( rhs.getAllocator(), {2}, {3} )));\n"\
+                    movers += "    rhs._{0}[{1}].reset( ::zerobuf::AllocatorPtr( " \
+                              "new ::zerobuf::StaticSubAllocator( rhs.getAllocator(), {2}, {3} )));\n" \
                         .format(initializer[0], i, initializer[3], initializer[3] + i * initializer[4])
         return movers
 
@@ -785,13 +844,13 @@ class FbsTable():
                     allocator = "::zerobuf::NonMovingSubAllocator( getAllocator(), {0}, {1}::ZEROBUF_NUM_DYNAMICS(), {1}::ZEROBUF_STATIC_SIZE( ))".format(initializer[3], initializer[2])
                 else:
                     allocator = "::zerobuf::StaticSubAllocator( getAllocator(), {0}, {1} )".format(initializer[3], initializer[4])
-                initializers += "    , _{0}( ::zerobuf::AllocatorPtr( new {1}))\n"\
+                initializers += "    , _{0}( ::zerobuf::AllocatorPtr( new {1}))\n" \
                     .format(initializer[0], allocator)
             else: # static array
                 initializers += "    , _{0}{1}".format(initializer[0], "{{")
                 for i in range( 0, initializer[1] ):
-                    initializers += "\n        {0}( ::zerobuf::AllocatorPtr( "\
-                        "new ::zerobuf::StaticSubAllocator( getAllocator(), {1}, {2} ))){3} "\
+                    initializers += "\n        {0}( ::zerobuf::AllocatorPtr( " \
+                                    "new ::zerobuf::StaticSubAllocator( getAllocator(), {1}, {2} ))){3} " \
                         .format(initializer[2], initializer[3] + i * initializer[4], initializer[4], "}}\n" if i == initializer[1] - 1 else ",")
         return initializers
 
@@ -802,6 +861,7 @@ class FbsFile():
         self.generate_qobject = False
         self.namespace = []
         self.enums = []
+        self.enum_names = set()
         self.tables = []
         self.table_names = set()
         # type lookup table: fbs type : ( size, C++ type )
@@ -848,7 +908,8 @@ class FbsFile():
 
     def add_enum(self, item):
         enum = FbsEnum(item)
-        self.types[ enum.name ] = ( 4, enum.name )
+        self.types[ enum.name ] = (4, enum.name)
+        self.enum_names.add(enum.name)
         self.enums.append(enum)
 
     def add_table(self, item):
@@ -856,7 +917,7 @@ class FbsFile():
         self.tables.append(table)
         self.table_names.add(table.name)
         # record size in type lookup table, 0 if dynamically sized
-        self.types[ table.name ] = ( table.get_offset(), table.name )
+        self.types[ table.name ] = ( table.offset if len(table.dynamic_members) == 0 else 0, table.name )
 
     def set_root_type(self, item):
         # Nothing to do with this statement
