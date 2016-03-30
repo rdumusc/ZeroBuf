@@ -179,6 +179,9 @@ class FixedSizeMember(ClassMember):
     def get_byte_size(self):
         return self.value_type.size
 
+    def get_cxxtype(self):
+        return self.value_type.type
+
     def get_initializer(self):
         return [self.cxxname, 1, self.value_type.type, self.allocator_offset, self.value_type.size]
 
@@ -282,6 +285,13 @@ class FixedSizeArray(ClassMember):
     def get_unique_identifier(self):
         return super().get_unique_identifier() + str(self.nElems).encode('utf-8')
 
+    def get_cxxtype(self):
+        if self.value_type.is_zerobuf_type:
+            # use the typedef for the std::array< T >
+            return self.cxxName
+        # static array of POD
+        return "std::vector< {0} >".format(self.value_type.type)
+
     def write_accessors_declaration(self, file):
         if self.value_type.is_zerobuf_type:
             file.write( "    typedef std::array< {0}, {1} > {2};\n".
@@ -353,6 +363,10 @@ class DynamicZeroBufMember(ClassMember):
 
     def get_byte_size(self):
         return 16 # 8b offset, 8b size
+
+    def get_cxxtype(self):
+        # dynamic Zerobuf member, use the ZeroBuf type
+        return self.value_type.type
 
     def get_initializer(self):
         return [self.cxxname, 1, self.value_type.type, self.dynamic_type_index, 0]
@@ -445,6 +459,12 @@ class DynamicMember(ClassMember):
     def get_unique_identifier(self):
         return super().get_unique_identifier() + b"Vector"
 
+    def get_cxxtype(self):
+        if self.value_type.is_string:
+            return "std::string"
+        # vector of any type
+        return "std::vector< {0} >".format(self.value_type.type)
+
     def get_initializer(self):
         return [self.cxxname, 0, self.cxxName, self.dynamic_type_index, self.value_type.size]
 
@@ -496,6 +516,7 @@ class FbsTable():
         self.offset = 0
         self.dynamic_members = []
         self.static_members = []
+        self.all_members = []
         self.zerobuf_types = set()
         self.functions = []
         self.initializers = []
@@ -518,11 +539,24 @@ class FbsTable():
         self.add_introspection_functions()
         self.add_json_functions()
 
+    def is_dynamic(self, attirb, fbsFile):
+        #  field is a sub-struct and field size is dynamic (==0)
+        if attirb[1] in fbsFile.table_names and fbsFile.types[attirb[1]][0] == 0:
+            return True
+
+        if attirb[1] == "string": # strings are dynamic
+            return True
+
+        if len(attirb) == 4: # name : [type] dynamic array
+            return True
+
+        return False
+
     def parse_members(self, fbsFile):
         dynamic_type_index = 0
-        for spec in self.attributes:
-            name = spec[0]
-            fbs_type = spec[1] if len(spec) < 4 else spec[2]
+        for attirb in self.attributes:
+            name = attirb[0]
+            fbs_type = attirb[1] if len(attirb) < 4 else attirb[2]
             cxxtype = fbsFile.types[fbs_type][1]
             cxxtype_size = fbsFile.types[fbs_type][0]
             is_zerobuf_type = cxxtype in fbsFile.table_names
@@ -530,24 +564,26 @@ class FbsTable():
             is_byte_type = fbs_type == "byte" or fbs_type == "ubyte"
             value_type = ValueType(cxxtype, cxxtype_size, is_zerobuf_type, is_enum_type, is_byte_type)
 
-            if self.is_dynamic(spec, fbsFile):
-                if len(spec) == 2 and is_zerobuf_type:
+            if self.is_dynamic(attirb, fbsFile):
+                if len(attirb) == 2 and is_zerobuf_type:
                     member = DynamicZeroBufMember(name, value_type, dynamic_type_index)
                 else:
                     member = DynamicMember(name, value_type, dynamic_type_index, self.name)
                 dynamic_type_index += 1
                 self.dynamic_members.append(member)
             else:
-                if len(spec) == 2 or len(spec) == 3:
+                if len(attirb) == 2 or len(attirb) == 3:
                     member = FixedSizeMember(name, value_type)
-                    if len(spec) == 3:
-                        default_values = spec[2]
+                    if len(attirb) == 3:
+                        default_values = attirb[2]
                         self.default_value_setters += "    set{0}({1}( {2} ));\n". \
                             format(member.cxxName, cxxtype, default_values)
                 else:
-                    elem_count = int(spec[4])
+                    elem_count = int(attirb[4])
                     member = FixedSizeArray(name, value_type, elem_count, self.name)
                 self.static_members.append(member)
+
+            self.all_members.append(member)
 
     def compute_offsets(self):
         self.offset = 4 # 4b version header in host endianness
@@ -569,9 +605,8 @@ class FbsTable():
         for member in self.static_members:
             self.md5.update(member.get_unique_identifier())
 
-    def add_virtual_destructor(self):
-        self.functions.append(Function(None, "~" + self.name + "()", "{}",
-                                       virtual=True, split=False))
+    def get_virtual_destructor(self):
+        return Function(None, "~" + self.name + "()", "{}", virtual=True, split=False)
 
     def add_empty_constructors(self):
         self.functions.append(Function(None, "{0}()".format( self.name ),
@@ -579,39 +614,42 @@ class FbsTable():
         self.functions.append(Function(None,
                                        "{0}( const {0}& )".format( self.name ),
                                        ": ::zerobuf::Zerobuf( ::zerobuf::AllocatorPtr( )){}"))
-        self.add_virtual_destructor()
+        self.functions.append(self.get_virtual_destructor())
         self.functions.append(Function(self.name+"&",
                                        "operator = ( const " + self.name + "& )",
                                        "return *this;",
                                        split=False))
 
     def add_special_member_functions(self, fbsFile):
+
+        allocator_init = ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n". \
+                                       format(self.name, self.offset, len(self.dynamic_members))
+
         # default ctor
         self.functions.append(Function(None, "{0}()".format(self.name),
-                                       ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n{{}}". \
-                                       format(self.name, self.offset, len(self.dynamic_members))))
+                                       allocator_init + "{}"))
 
         # member initialization ctor
         memberArgs = []
-        initializers = ''
-        for spec in self.attributes:
-            cxxname = spec[0]
-            cxxName = cxxname[0].upper() + cxxname[1:]
-            cxxtype = self.get_cxxtype(spec, fbsFile)
-            valueName = cxxname + 'Value'
-            memberArgs.append("const {0}& {1}".format(cxxtype, valueName))
-            initializers += "    set{0}( {1} );\n".format(cxxName, valueName)
+        setters = []
+        for member in self.all_members:
+            valueName = member.cxxname + 'Value'
+            memberArgs.append("const {0}& {1}".format(member.get_cxxtype(), valueName))
+            setters.append("set{0}( {1} );".format(member.cxxName, valueName))
         self.functions.append(Function( None,
                                         "{0}( {1} )".format(self.name, ', '.join(memberArgs)),
-                                        ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n"
-                                        "{{\n{3}}}".format(self.name, self.offset, len(self.dynamic_members), initializers)))
+                                        allocator_init +
+                                        "{\n    " +
+                                        "\n    ".join(setters) +
+                                        "\n}"))
 
         # copy ctor
         self.functions.append(Function(None,
                                        "{0}( const {0}& rhs )".format(self.name),
-                                       ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n". \
-                                       format(self.name, self.offset, len(self.dynamic_members)) +
-                                       "{\n    *this = rhs;\n}"))
+                                       allocator_init +
+                                       "{\n" +
+                                       "    *this = rhs;\n" +
+                                       "}"))
 
         # move ctor
         self.functions.append(Function(None,
@@ -622,8 +660,7 @@ class FbsTable():
         # copy-from-baseclass ctor
         self.functions.append(Function(None,
                                        "{0}( const ::zerobuf::Zerobuf& rhs )".format(self.name),
-                                       ": {0}( ::zerobuf::AllocatorPtr( new ::zerobuf::NonMovingAllocator( {1}, {2} )))\n". \
-                                       format(self.name, self.offset, len(self.dynamic_members)) +
+                                       allocator_init +
                                        "{\n" +
                                        "    ::zerobuf::Zerobuf::operator = ( rhs );\n" +
                                        "}"))
@@ -635,7 +672,7 @@ class FbsTable():
                                        "{{\n{3}}}".format(self.name, self.offset, len(self.dynamic_members), self.default_value_setters),
                                        explicit = True))
 
-        self.add_virtual_destructor()
+        self.functions.append(self.get_virtual_destructor())
 
         # copy ctor and copy assignment operator
         self.functions.append(Function(self.name+"&",
@@ -648,7 +685,6 @@ class FbsTable():
                                        "::zerobuf::Zerobuf::operator = ( std::move( rhs ));\n" +
                                        self.get_move_operator() +
                                        "    return *this;"))
-
 
     def add_introspection_functions(self):
         digest = self.md5.hexdigest()
@@ -690,45 +726,6 @@ class FbsTable():
         to_json = to_json[4:]
         self.functions.append(Function("void", "_parseJSON( const Json::Value& json ) final", from_json))
         self.functions.append(Function("void", "_createJSON( Json::Value& json ) const final", to_json))
-
-    def is_dynamic(self, spec, fbsFile):
-        #  field is a sub-struct and field size is dynamic
-        if spec[1] in fbsFile.table_names and fbsFile.types[spec[1]][0] == 0:
-            return True
-
-        if spec[1] == "string": # strings are dynamic
-            return True
-
-        if len(spec) == 4: # name : [type] dynamic array
-            return True
-
-        return False
-
-    def get_cxxtype(self, spec, fbsFile):
-        fbs_type = spec[1] if len(spec) < 4 else spec[2]
-
-        if self.is_dynamic(spec, fbsFile):
-            if fbs_type == "string":
-                cxxtype = "std::string"
-            elif(len(spec) == 2 and fbs_type in fbsFile.table_names):
-                # dynamic Zerobuf member, use the type directly
-                cxxtype = fbs_type
-            else:
-                # vector of any type
-                cxxtype = "std::vector< {0} >".format(fbsFile.types[fbs_type][1])
-        else:
-            if len(spec) == 2 or len(spec) == 3:
-                cxxtype = fbsFile.types[fbs_type][1] # static member
-            else:
-                if fbs_type in fbsFile.table_names:
-                    # static array of zerobuf type, use the typedef for the std::array< T >
-                    cxxname = spec[0]
-                    cxxName = cxxname[0].upper() + cxxname[1:]
-                    cxxtype = cxxName
-                else:
-                    # static array of POD
-                    cxxtype = "std::vector< {0} >".format(fbsFile.types[fbs_type][1])
-        return cxxtype
 
     def write_declaration(self, file):
         self.write_class_begin(file)
