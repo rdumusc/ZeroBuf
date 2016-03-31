@@ -110,7 +110,7 @@ class Function():
         else:
             file.write( "    {0}\n".format(self.get_declaration()))
 
-    def write_implementation(self, file, classname):
+    def write_implementation(self, file, classname, extra_op = ""):
         if not self.split_implementation:
             return
 
@@ -118,14 +118,16 @@ class Function():
         impl_function = re.sub(r" = [0-9\.f]+ ", " ", impl_function) # remove default params
 
         if self.ret_val: # '{}'-less body
-            file.write( "\n" + self.ret_val + " " + classname +
-                        "::" + impl_function +
-                        "\n{" +
-                        NEXTLINE + self.body +
-                        "\n}\n" )
+            file.write("\n" + self.ret_val + " " + classname +
+                       "::" + impl_function +
+                       "\n{" +
+                       NEXTLINE + self.body)
+            if extra_op:
+                file.write(NEXTLINE + extra_op)
+            file.write("\n}\n")
         else:      # ctor '[initializer list]{ body }'
-            file.write( "\n" + classname +
-                        "::" + impl_function + NEXTLINE + self.body + "\n\n" )
+            file.write("\n" + classname +
+                       "::" + impl_function + NEXTLINE + self.body + "\n\n")
 
 
 """A member of a C++ class"""
@@ -136,16 +138,36 @@ class ClassMember(object):
         self.cxxName = name[0].upper() + str(name[1:])
         self.value_type = value_type
         self.allocator_offset = 0
+        self.qsignal = self.cxxname + "Changed();"
+
+    def write_typedefs(self, file):
+        """Derived classes may implement this function to declare typedefs"""
+        return
 
     def write_accessors_declaration(self, file):
+        self.write_typedefs(file)
         for function in self.accessor_functions():
             function.write_declaration(file)
-        file.write("\n")
 
-    def write_accessors_implementation(self, file, classname):
-        for function in self.accessor_functions():
-            function.write_implementation(file, classname)
-        file.write("\n")
+    def write_qt_getters(self, file):
+        self.write_typedefs(file)
+        for function in self.const_getters():
+            function.write_declaration(file)
+
+    def write_qt_setters(self, file):
+        for function in self.setters():
+            function.write_declaration(file)
+
+    def write_accessors_implementation(self, file, classname, generate_qobject):
+        if generate_qobject:
+            for function in self.const_getters():
+                function.write_implementation(file, classname)
+            signal = "emit " + self.qsignal
+            for function in self.setters():
+                function.write_implementation(file, classname, signal)
+        else:
+            for function in self.accessor_functions():
+                function.write_implementation(file, classname)
 
     def get_unique_identifier(self):
         return self.value_type.type.encode('utf-8')
@@ -246,6 +268,11 @@ class FixedSizeMember(ClassMember):
             return [self.const_ref_getter(), self.ref_getter()]
         return [self.value_getter()]
 
+    def const_getters(self):
+        if self.value_type.is_zerobuf_type:
+            return [self.const_ref_getter()]
+        return self.getters()
+
     def setters(self):
         if self.value_type.is_zerobuf_type:
             return [self.ref_setter()]
@@ -307,6 +334,14 @@ class FixedSizeArray(ClassMember):
                 self.vector_getter(self.nElems),
                 self.size_getter()]
 
+    def const_getters(self):
+        if self.value_type.is_zerobuf_type:
+            return [self.const_ref_getter(self.classname),
+                    self.size_getter()]
+        return [self.const_ptr_getter(),
+                self.vector_getter(self.nElems),
+                self.size_getter()]
+
     def setters(self):
         if self.value_type.is_zerobuf_type:
             return [self.ref_setter()]
@@ -343,11 +378,10 @@ class FixedSizeArray(ClassMember):
         # static array of POD
         return "std::vector< {0} >".format(self.value_type.type)
 
-    def write_accessors_declaration(self, file):
+    def write_typedefs(self, file):
         if self.value_type.is_zerobuf_type:
-            file.write( "    typedef std::array< {0}, {1} > {2};\n".
-                          format( self.value_type.type, self.nElems, self.cxxName ))
-        super(FixedSizeArray, self).write_accessors_declaration(file)
+            file.write("    typedef std::array< {0}, {1} > {2};\n".
+                       format(self.value_type.type, self.nElems, self.cxxName))
 
     def get_initializer(self):
         return [self.cxxname, self.nElems, self.value_type.type, self.allocator_offset, self.value_type.size]
@@ -405,6 +439,9 @@ class DynamicZeroBufMember(ClassMember):
     def getters(self):
         return [self.ref_getter(),
                 self.const_ref_getter()]
+
+    def const_getters(self):
+        return [self.const_ref_getter()]
 
     def setters(self):
         return [self.ref_setter()]
@@ -507,6 +544,15 @@ class DynamicMember(ClassMember):
                 self.vector_pod_getter(),
                 self.string_getter()]
 
+    def const_getters(self):
+        if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
+            return [self.const_ref_getter(self.classname),
+                    self.vector_dynamic_getter()]
+        # Dynamic array of PODs
+        return [self.const_ref_getter(self.classname),
+                self.vector_pod_getter(),
+                self.string_getter()]
+
     def setters(self):
         if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
             return [self.vector_dynamic_setter()]
@@ -552,10 +598,9 @@ class DynamicMember(ClassMember):
     def get_declaration(self):
         return "{0} _{1};".format(self.cxxName, self.cxxname)
 
-    def write_accessors_declaration(self, file):
-        file.write( "    typedef ::zerobuf::Vector< {0} > {1};\n".
-                      format(self.value_type.type, self.cxxName))
-        super(DynamicMember, self).write_accessors_declaration(file)
+    def write_typedefs(self, file):
+        file.write("    typedef ::zerobuf::Vector< {0} > {1};\n".
+                   format(self.value_type.type, self.cxxName))
 
     def from_json(self):
         if self.value_type.is_string:
@@ -808,14 +853,13 @@ class FbsTable():
         self.functions.append(Function("void", "_parseJSON( const Json::Value& json ) final", from_json))
         self.functions.append(Function("void", "_createJSON( Json::Value& json ) const final", to_json))
 
-    def write_declaration(self, file):
-        self.write_class_begin(file)
+    def write_declaration(self, file, generate_qobject):
+        self.write_class_begin(file, generate_qobject)
 
-        # members accessors
-        for member in self.dynamic_members:
-            member.write_accessors_declaration(file)
-        for member in self.static_members:
-            member.write_accessors_declaration(file)
+        if(generate_qobject):
+            self.write_qobject_members(file)
+        else:
+            self.write_members(file)
 
         # class functions
         for function in self.functions:
@@ -823,9 +867,49 @@ class FbsTable():
 
         self.write_class_end(file)
 
-    def write_class_begin(self, file):
-        file.write( "class " + self.name + " : public ::zerobuf::Zerobuf\n" +
-                    "{\npublic:\n" )
+    def write_class_begin(self, file, generate_qobject):
+        parent_classes = ["public ::zerobuf::Zerobuf"]
+        if generate_qobject:
+            parent_classes.insert(0, "public QObject")
+        parents = ", ".join(parent_classes)
+        file.write( "class {0} : {1}\n".format(self.name, parents))
+        file.write( "{\n" )
+        if generate_qobject:
+            file.write( "    Q_OBJECT\n\n" )
+        file.write( "public:\n" )
+
+    def write_qobject_members(self, file):
+        if len(self.all_members) == 0:
+            return
+
+        for member in self.dynamic_members:
+            member.write_qt_getters(file)
+        for member in self.static_members:
+            member.write_qt_getters(file)
+        file.write("\n")
+
+        file.write("public slots:\n")
+        for member in self.dynamic_members:
+            member.write_qt_setters(file)
+        for member in self.static_members:
+            member.write_qt_setters(file)
+        file.write("\n")
+
+        file.write("signals:")
+        for member in self.dynamic_members:
+            file.write(NEXTLINE + "void " + member.qsignal)
+        for member in self.static_members:
+            file.write(NEXTLINE + "void " + member.qsignal)
+        file.write("\n\n")
+        file.write( "public:\n" )
+
+    def write_members(self, file):
+        for member in self.dynamic_members:
+            member.write_accessors_declaration(file)
+            file.write("\n")
+        for member in self.static_members:
+            member.write_accessors_declaration(file)
+            file.write("\n")
 
     def write_class_end(self, file):
         member_declarations = []
@@ -840,12 +924,14 @@ class FbsTable():
         file.write(NEXTLINE.join(member_declarations))
         file.write("\n};\n\n")
 
-    def write_implementation(self, file):
+    def write_implementation(self, file, generate_qobject):
         # members accessors
         for member in self.dynamic_members:
-            member.write_accessors_implementation(file, self.name)
+            member.write_accessors_implementation(file, self.name, generate_qobject)
+            file.write("\n")
         for member in self.static_members:
-            member.write_accessors_implementation(file, self.name)
+            member.write_accessors_implementation(file, self.name, generate_qobject)
+            file.write("\n")
         # class functions
         for function in self.functions:
             function.write_implementation(file, self.name)
@@ -1013,6 +1099,8 @@ class FbsFile():
     def write_declaration(self, header):
         header.write( "// Generated by zerobufCxx.py\n\n" )
         header.write( "#pragma once\n" )
+        if self.generate_qobject:
+            header.write( "#include <QObject> // base class\n" )
         header.write( "#include <zerobuf/Zerobuf.h> // base class\n" )
         header.write( "#include <zerobuf/Vector.h> // member\n" )
         header.write( "#include <array> // member\n" )
@@ -1024,24 +1112,24 @@ class FbsFile():
             enum.write_declaration(header)
 
         for table in self.tables:
-            table.write_declaration(header)
+            table.write_declaration(header, self.generate_qobject)
 
         self.write_namespace_closing(header)
 
     """Write the C++ implementation file."""
-    def write_implementation(self, cppsource):
-        cppsource.write("#include <zerobuf/NonMovingAllocator.h>\n")
-        cppsource.write("#include <zerobuf/NonMovingSubAllocator.h>\n")
-        cppsource.write("#include <zerobuf/StaticSubAllocator.h>\n")
-        cppsource.write("#include <zerobuf/json.h>\n")
-        cppsource.write("\n")
+    def write_implementation(self, file):
+        file.write("#include <zerobuf/NonMovingAllocator.h>\n")
+        file.write("#include <zerobuf/NonMovingSubAllocator.h>\n")
+        file.write("#include <zerobuf/StaticSubAllocator.h>\n")
+        file.write("#include <zerobuf/json.h>\n")
+        file.write("\n")
 
-        self.write_namespace_opening(cppsource)
+        self.write_namespace_opening(file)
 
         for table in self.tables:
-            table.write_implementation(cppsource)
+            table.write_implementation(file, self.generate_qobject)
 
-        self.write_namespace_closing(cppsource)
+        self.write_namespace_closing(file)
 
 
 if __name__ == "__main__":
