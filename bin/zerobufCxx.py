@@ -125,7 +125,7 @@ class Function():
 
 
 """A member of a C++ class"""
-class ClassMember():
+class ClassMember(object):
     def __init__(self, name, value_type):
         assert(isinstance(value_type, ValueType))
         self.cxxname = name
@@ -283,7 +283,7 @@ class FixedSizeArray(ClassMember):
         return self.value_type.size * self.nElems
 
     def get_unique_identifier(self):
-        return super().get_unique_identifier() + str(self.nElems).encode('utf-8')
+        return super(FixedSizeArray, self).get_unique_identifier() + str(self.nElems).encode('utf-8')
 
     def get_cxxtype(self):
         if self.value_type.is_zerobuf_type:
@@ -296,7 +296,7 @@ class FixedSizeArray(ClassMember):
         if self.value_type.is_zerobuf_type:
             file.write( "    typedef std::array< {0}, {1} > {2};\n".
                           format( self.value_type.type, self.nElems, self.cxxName ))
-        super().write_accessors_declaration(file)
+        super(FixedSizeArray, self).write_accessors_declaration(file)
 
     def get_initializer(self):
         return [self.cxxname, self.nElems, self.value_type.type, self.allocator_offset, self.value_type.size]
@@ -457,7 +457,7 @@ class DynamicMember(ClassMember):
         return 16 # 8b offset, 8b size
 
     def get_unique_identifier(self):
-        return super().get_unique_identifier() + b"Vector"
+        return super(DynamicMember, self).get_unique_identifier() + b"Vector"
 
     def get_cxxtype(self):
         if self.value_type.is_string:
@@ -469,12 +469,12 @@ class DynamicMember(ClassMember):
         return [self.cxxname, 0, self.cxxName, self.dynamic_type_index, self.value_type.size]
 
     def get_declaration(self):
-        return "{0} _{1};".format( self.cxxName, self.cxxname )
+        return "{0} _{1};".format(self.cxxName, self.cxxname)
 
     def write_accessors_declaration(self, file):
         file.write( "    typedef ::zerobuf::Vector< {0} > {1};\n".
-                      format( self.value_type.type, self.cxxName ))
-        super().write_accessors_declaration(file)
+                      format(self.value_type.type, self.cxxName))
+        super(DynamicMember, self).write_accessors_declaration(file)
 
     def from_json(self):
         if self.value_type.is_string:
@@ -972,10 +972,10 @@ if __name__ == "__main__":
     parser.add_argument( "files", nargs = "*" )
     parser.add_argument( '-o', '--outputdir', action='store', default = "",
                          help = "Prefix directory for all generated files.")
-    parser.add_argument( '-e', '--extension', action='store', default = "cpp",
-                         help = "Extension for generated source files.")
     parser.add_argument( '-q', '--qobject', action='store_true',
                          help = "Generate a QObject with signals and slots.")
+    parser.add_argument( '-e', '--extension', action='store', default = "cpp",
+                         help = "Extension for generated source files. (default: cpp)")
 
     # Parse, interpret and validate arguments
     args = parser.parse_args()
