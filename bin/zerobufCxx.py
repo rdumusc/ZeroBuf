@@ -14,6 +14,8 @@ from pyparsing import *
 import sys
 import os
 
+NEXTLINE = "\n    "
+
 fbsBaseType = oneOf( "int uint float double byte short ubyte ushort ulong uint8_t uint16_t " +
                      "uint32_t uint64_t uint128_t int8_t int16_t int32_t int64_t bool string" )
 
@@ -117,11 +119,13 @@ class Function():
 
         if self.ret_val: # '{}'-less body
             file.write( "\n" + self.ret_val + " " + classname +
-                        "::" + impl_function + "\n{\n    " + self.body +
+                        "::" + impl_function +
+                        "\n{" +
+                        NEXTLINE + self.body +
                         "\n}\n" )
         else:      # ctor '[initializer list]{ body }'
             file.write( "\n" + classname +
-                        "::" + impl_function + "\n    " + self.body + "\n\n" )
+                        "::" + impl_function + NEXTLINE + self.body + "\n\n" )
 
 
 """A member of a C++ class"""
@@ -134,17 +138,102 @@ class ClassMember(object):
         self.allocator_offset = 0
 
     def write_accessors_declaration(self, file):
-        for function in self.get_accessor_functions():
+        for function in self.accessor_functions():
             function.write_declaration(file)
         file.write("\n")
 
     def write_accessors_implementation(self, file, classname):
-        for function in self.get_accessor_functions():
+        for function in self.accessor_functions():
             function.write_implementation(file, classname)
         file.write("\n")
 
     def get_unique_identifier(self):
         return self.value_type.type.encode('utf-8')
+
+    def accessor_functions(self):
+        return self.getters() + self.setters()
+
+    def qualified_type(self, classname):
+        return "{0}::{1}".format(classname, self.get_cxxtype())
+
+    def const_ref_getter(self, classname=None):
+        val_type = self.qualified_type(classname) if classname else self.get_cxxtype()
+        return Function("const {0}&".format(val_type),
+                        "get" + self.cxxName + "() const",
+                        "return _{0};".format(self.cxxname))
+
+    def ref_getter(self, classname=None):
+        val_type = self.qualified_type(classname) if classname else self.get_cxxtype()
+        return Function("{0}&".format(val_type),
+                        "get" + self.cxxName + "()",
+                        "notifyChanging();" + NEXTLINE +
+                        "return _{0};".format(self.cxxname))
+
+    def ptr_getter(self):
+        return Function(self.value_type.type + "*",
+                        "get" + self.cxxName + "()",
+                        "notifyChanging();" + NEXTLINE +
+                        "return getAllocator().template getItemPtr< {0} >( {1} );".\
+                        format(self.value_type.type, self.allocator_offset))
+
+    def const_ptr_getter(self):
+        return Function("const {0}*".format(self.value_type.type),
+                        "get" + self.cxxName + "() const",
+                        "return getAllocator().template getItemPtr< {0} >( {1} );".\
+                        format(self.value_type.type, self.allocator_offset))
+
+    def value_getter(self):
+        return Function(self.get_cxxtype(),
+                        "get{0}() const".format(self.cxxName),
+                        "return getAllocator().template getItem< {0} >( {1} );".\
+                        format(self.get_cxxtype(), self.allocator_offset))
+
+    def vector_getter(self, elem_count):
+        return Function(self.get_cxxtype(),
+                        "get{0}Vector() const".format(self.cxxName),
+                        "const {0}* ptr = getAllocator().template getItemPtr< {0} >( {1} );".\
+                        format(self.value_type.type, self.allocator_offset) + NEXTLINE +
+                        "return {0}( ptr, ptr + {1} );".format(self.get_cxxtype(), elem_count))
+
+    def ref_setter(self):
+        return Function("void",
+                        "set{0}( const {1}& value )".format(self.cxxName, self.get_cxxtype()),
+                        "notifyChanging();" + NEXTLINE +
+                        "_{0} = value;".format(self.cxxname))
+
+    def value_setter(self):
+        return Function("void",
+                        "set{0}( {1} value )".format(self.cxxName, self.get_cxxtype()),
+                        "notifyChanging();" + NEXTLINE +
+                        "getAllocator().template getItem< {0} >( {1} ) = value;".\
+                        format(self.get_cxxtype(), self.allocator_offset))
+
+    def c_array_setter(self, elem_count):
+        return Function("void",
+                        "set{0}( {1} value[ {2} ] )".format(self.cxxName, self.value_type.type, elem_count),
+                        "notifyChanging();" + NEXTLINE +
+                        "::memcpy( getAllocator().template getItemPtr< {0} >( {1} ), value, {2} * sizeof( {0} ));".\
+                        format(self.value_type.type, self.allocator_offset, elem_count))
+
+    def vector_setter(self, elem_count):
+        return Function("void",
+                        "set{0}( const std::vector< {1} >& value )".format(self.cxxName, self.value_type.type),
+                        "if( {0} >= value.size( ))".format(elem_count) + NEXTLINE +
+                        "{" + NEXTLINE +
+                        "    notifyChanging();" +
+                        "        ::memcpy( getAllocator().template getItemPtr<{0}>( {1} ), value.data(), value.size() * sizeof( {0}));"\
+                        .format(self.value_type.type, self.allocator_offset) + NEXTLINE +
+                        "}")
+
+    def string_setter(self):
+        return Function("void",
+                        "set{0}( const std::string& value )".format(self.cxxName),
+                        "if( {0} >= value.length( ))".format(self.get_byte_size()) + NEXTLINE +
+                        "{" + NEXTLINE +
+                        "    notifyChanging();" + NEXTLINE +
+                        "    ::memcpy( getAllocator().template getItemPtr<{0}>( {1} ), value.data(), value.length( ));"\
+                        .format(self.value_type.type,self.allocator_offset) + NEXTLINE +
+                        "}")
 
 
 """A member of a class which has a fixed size (such as a POD type)"""
@@ -152,29 +241,15 @@ class FixedSizeMember(ClassMember):
     def __init__(self, name, type):
         super(FixedSizeMember, self).__init__(name, type)
 
-    def get_accessor_functions(self):
-        functions = []
+    def getters(self):
         if self.value_type.is_zerobuf_type:
-            functions.append(Function( "const {0}&".format( self.value_type.type ),
-                          "get" + self.cxxName + "() const",
-                          "return _{0};".format( self.cxxname )))
-            functions.append(Function( "{0}&".format( self.value_type.type ), "get" + self.cxxName + "()",
-                          "notifyChanging();\n    " +
-                          "return _{0};".format( self.cxxname )))
-            functions.append(Function( "void",
-                          "set"  + self.cxxName + "( const " + self.value_type.type + "& value )",
-                          "notifyChanging();\n    " +
-                          "_{0} = value;".format( self.cxxname )))
-        else:
-            functions.append(Function(self.value_type.type, "get" + self.cxxName + "() const",
-                          "return getAllocator().template getItem< " + self.value_type.type +
-                          " >( " + str( self.allocator_offset ) + " );" ))
-            functions.append(Function( "void",
-                          "set{0}( {1} value )".format(self.cxxName, self.value_type.type),
-                          "notifyChanging();\n    " +
-                          "getAllocator().template getItem< {0} >( {1} ) = value;".\
-                          format(self.value_type.type, self.allocator_offset)))
-        return functions
+            return [self.const_ref_getter(), self.ref_getter()]
+        return [self.value_getter()]
+
+    def setters(self):
+        if self.value_type.is_zerobuf_type:
+            return [self.ref_setter()]
+        return [self.value_setter()]
 
     def get_byte_size(self):
         return self.value_type.size
@@ -218,66 +293,42 @@ class FixedSizeArray(ClassMember):
             if self.value_type.size == 0:
                 sys.exit("Static arrays of empty ZeroBuf (field {0}) not supported".format(self.cxxname))
 
-    def get_accessor_functions(self):
-        functions = []
-        if self.value_type.is_zerobuf_type:
-            functions.append(Function( "const {0}::{1}&".format( self.classname, self.cxxName ),
-                          "get" + self.cxxName + "() const",
-                          "return _{0};".format( self.cxxname )))
-            functions.append(Function( "{0}::{1}&".format( self.classname, self.cxxName ),
-                          "get" + self.cxxName + "()",
-                          "notifyChanging();\n    " +
-                          "return _{0};".format( self.cxxname )))
-            functions.append(Function( "void",
-                          "set{0}( const {0}& value )".format( self.cxxName ),
-                          "notifyChanging();\n    " +
-                          "_{0} = value;".format( self.cxxname )))
-        else:
-            functions.append(Function( self.value_type.type + "*", "get" + self.cxxName + "()",
-                          "notifyChanging();\n    " +
-                          "return getAllocator().template getItemPtr< " + self.value_type.type +
-                          " >( " + str( self.allocator_offset ) + " );" ))
-            functions.append(Function( "const " + self.value_type.type + "*",
-                          "get" + self.cxxName + "() const",
-                          "return getAllocator().template getItemPtr< " + self.value_type.type +
-                          " >( " + str( self.allocator_offset ) + " );" ))
-            functions.append(Function( "std::vector< " + self.value_type.type + " >",
-                          "get" + self.cxxName + "Vector() const",
-                          "const " + self.value_type.type + "* ptr = getAllocator().template " +
-                          "getItemPtr< " + self.value_type.type + " >( " + str( self.allocator_offset ) +
-                          " );\n    return std::vector< " + self.value_type.type +
-                          " >( ptr, ptr + " + str( self.nElems ) + " );" ))
-            functions.append(Function( "void",
-                          "set"  + self.cxxName + "( " + self.value_type.type + " value[ " +
-                          str(self.nElems) + " ] )",
-                          "notifyChanging();\n    " +
-                          "::memcpy( getAllocator().template getItemPtr< " +
-                          self.value_type.type + " >( " + str( self.allocator_offset ) + " ), value, " +
-                          str( self.nElems ) + " * sizeof( " + self.value_type.type + " ));" ))
-            functions.append(Function( "void",
-                          "set" + self.cxxName + "( const std::vector< " +
-                          self.value_type.type + " >& value )",
-                          "if( " + str( self.nElems ) + " >= value.size( ))\n" +
-                          "    {\n" +
-                          "        notifyChanging();" +
-                          "        ::memcpy( getAllocator().template getItemPtr<" +
-                          self.value_type.type + ">( " + str( self.allocator_offset ) +
-                          " ), value.data(), value.size() * sizeof( " + self.value_type.type +
-                          "));\n" +
-                          "    }" ))
-            functions.append(Function( "void",
-                          "set" + self.cxxName + "( const std::string& value )",
-                          "if( " + str(self.get_byte_size()) + " >= value.length( ))\n" +
-                          "    {\n" +
-                          "        notifyChanging();\n" +
-                          "        ::memcpy( getAllocator().template getItemPtr<" +
-                          self.value_type.type + ">( " + str( self.allocator_offset ) +
-                          " ), value.data(), value.length( ));\n" +
-                          "    }" ))
+    def size_getter(self):
+        return Function("size_t", "get{0}Size() const".format(self.cxxName),
+                        "return {0};".format(self.nElems))
 
-        functions.append(Function( "size_t", "get" + self.cxxName + "Size() const",
-                      "return {0};".format(self.nElems)))
-        return functions
+    def getters(self):
+        if self.value_type.is_zerobuf_type:
+            return [self.const_ref_getter(self.classname),
+                    self.ref_getter(self.classname),
+                    self.size_getter()]
+        return [self.ptr_getter(),
+                self.const_ptr_getter(),
+                self.vector_getter(self.nElems),
+                self.size_getter()]
+
+    def setters(self):
+        if self.value_type.is_zerobuf_type:
+            return [self.ref_setter()]
+        return [self.c_array_setter(self.nElems),
+                self.vector_setter(self.nElems),
+                self.string_setter()]
+
+    def accessor_functions(self):
+        """Override ClassMember.accessor_functions for legacy ordering of functions"""
+        if self.value_type.is_zerobuf_type:
+            return [self.const_ref_getter(self.classname),
+                    self.ref_getter(self.classname),
+                    self.ref_setter(),
+                    self.size_getter()]
+        # Dynamic array of PODs
+        return [self.ptr_getter(),
+                self.const_ptr_getter(),
+                self.vector_getter(self.nElems),
+                self.c_array_setter(self.nElems),
+                self.vector_setter(self.nElems),
+                self.string_setter(),
+                self.size_getter()]
 
     def get_byte_size(self):
         return self.value_type.size * self.nElems
@@ -351,15 +402,12 @@ class DynamicZeroBufMember(ClassMember):
         super(DynamicZeroBufMember,self).__init__(name, type)
         self.dynamic_type_index = dynamic_type_index
 
-    def get_accessor_functions(self):
-        functions = []
-        functions.append(Function("{0}&".format(self.value_type.type), "get{0}()".format(self.cxxName),
-                                   "notifyChanging();\n    return _{0};".format(self.cxxname)))
-        functions.append(Function("const {0}&".format(self.value_type.type), "get{0}() const".format(self.cxxName),
-                                   "return _{0};".format(self.cxxname)))
-        functions.append(Function("void", "set{0}( const {1}& value )".format(self.cxxName, self.value_type.type),
-                                   "notifyChanging();\n    _{0} = value;".format(self.cxxname)))
-        return functions
+    def getters(self):
+        return [self.ref_getter(),
+                self.const_ref_getter()]
+
+    def setters(self):
+        return [self.ref_setter()]
 
     def get_byte_size(self):
         return 16 # 8b offset, 8b size
@@ -392,66 +440,93 @@ class DynamicMember(ClassMember):
             if self.value_type.size == 0:
                 sys.exit("Dynamic arrays of empty ZeroBuf (field {0}) not supported".format(self.cxxname))
 
-    def get_accessor_functions(self):
-        functions = []
-        functions.append(Function( "{0}::{1}&".format( self.classname, self.cxxName ),
-                                        "get" + self.cxxName + "()",
-                                        "notifyChanging();\n    " +
-                                        "return _{0};".format( self.cxxname )))
-        functions.append(Function( "const {0}::{1}&".format( self.classname, self.cxxName ),
-                                        "get" + self.cxxName + "() const",
-                                        "return _{0};".format( self.cxxname )))
+    def vector_dynamic_getter(self):
+        return Function(self.vector_type(),
+                        "get{0}Vector() const".format(self.cxxName),
+                        "const {0}& vec = get{0}();".format(self.cxxName) + NEXTLINE +
+                        "{0} ret;".format(self.vector_type()) + NEXTLINE +
+                        "ret.reserve( vec.size( ));" + NEXTLINE +
+                        "for( size_t i = 0; i < vec.size(); ++i )" + NEXTLINE +
+                        "    ret.push_back( vec[i] );" + NEXTLINE +
+                        "return ret;\n")
 
+    def vector_dynamic_setter(self):
+        return Function("void",
+                        "set{0}( const {1}& values )".format(self.cxxName, self.vector_type()),
+                        "notifyChanging();" + NEXTLINE +
+                        "::zerobuf::Vector< {0} > dynamic( getAllocator(), {1} );".\
+                        format(self.value_type.type, self.dynamic_type_index) + NEXTLINE +
+                        "dynamic.clear();" + NEXTLINE +
+                        "for( const " + self.value_type.type + "& data : values )" + NEXTLINE +
+                        "    dynamic.push_back( data );")
+
+    def c_pointer_setter(self):
+        return Function("void",
+                        "set{0}( {1} const * value, size_t size )".\
+                        format(self.cxxName, self.value_type.type),
+                        "notifyChanging();" + NEXTLINE +
+                        "_copyZerobufArray( value, size * sizeof( {0} ), {1} );".\
+                        format(self.value_type.type, self.dynamic_type_index))
+
+    def vector_pod_getter(self):
+        return Function(self.vector_type(),
+                        "get{0}Vector() const".format(self.cxxName),
+                        "return {0}( _{1}.data(), _{1}.data() + _{1}.size( ));".\
+                        format(self.vector_type(), self.cxxname))
+
+    def vector_pod_setter(self):
+        return Function("void",
+                        "set{0}( const {1}& value )".format(self.cxxName, self.vector_type()),
+                        "notifyChanging();" + NEXTLINE +
+                        "_copyZerobufArray( value.data(), value.size() * sizeof( {0} ), {1} );".\
+                        format(self.value_type.type, self.dynamic_type_index))
+
+    def string_getter(self):
+        return Function("std::string",
+                        "get{0}String() const".format(self.cxxName),
+                        "const uint8_t* ptr = getAllocator().template getDynamic< const uint8_t >( {0} );".\
+                        format(self.dynamic_type_index) + NEXTLINE +
+                        "return std::string( ptr, ptr + getAllocator().template getItem< uint64_t >( {0} ));".\
+                        format(self.allocator_offset + 8))
+
+    def string_setter(self):
+        return Function("void",
+                        "set{0}( const std::string& value )".format(self.cxxName),
+                        "notifyChanging();" + NEXTLINE +
+                        "_copyZerobufArray( value.c_str(), value.length(), {0} );".\
+                        format(self.dynamic_type_index))
+
+    def getters(self):
         if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
-            functions.append(Function( "std::vector< " + self.value_type.type + " >",
-                                            "get" + self.cxxName + "Vector() const",
-                                            "const {0}& vec = get{0}();\n".format( self.cxxName ) +
-                                            "    std::vector< " + self.value_type.type + " > ret;\n" +
-                                            "    ret.reserve( vec.size( ));\n" +
-                                            "    for( size_t i = 0; i < vec.size(); ++i )\n" +
-                                            "        ret.push_back( vec[i] );\n" +
-                                            "    return ret;\n" ))
-            functions.append(Function( "void",
-                                            "set" + self.cxxName + "( const std::vector< " +
-                                            self.value_type.type + " >& values )",
-                                            "notifyChanging();\n    " +
-                                            "::zerobuf::Vector< {0} > dynamic( getAllocator(), {1} );\n". \
-                                            format(self.value_type.type, self.dynamic_type_index) +
-                                            "    dynamic.clear();\n" +
-                                            "    for( const " + self.value_type.type + "& data : values )\n" +
-                                            "        dynamic.push_back( data );" ))
+            return [self.ref_getter(self.classname),
+                    self.const_ref_getter(self.classname),
+                    self.vector_dynamic_getter()]
+        # Dynamic array of PODs
+        return [self.ref_getter(self.classname),
+                self.const_ref_getter(self.classname),
+                self.vector_pod_getter(),
+                self.string_getter()]
 
-        else: # Dynamic array of PODs
-            functions.append(Function( "void",
-                                            "set{0}( {1} const * value, size_t size )". \
-                                            format(self.cxxName, self.value_type.type),
-                                            "notifyChanging();\n    " +
-                                            "_copyZerobufArray( value, size * sizeof( " + self.value_type.type +
-                                            " ), " + str( self.dynamic_type_index ) + " );" ))
-            functions.append(Function( "std::vector< " + self.value_type.type + " >",
-                                            "get" + self.cxxName + "Vector() const",
-                                            "return std::vector< {0} >( _{1}.data(), _{1}.data() + _{1}.size( ));". \
-                                            format(self.value_type.type, self.cxxname)))
-            functions.append(Function( "void",
-                                            "set" + self.cxxName + "( const std::vector< " +
-                                            self.value_type.type + " >& value )",
-                                            "notifyChanging();\n    " +
-                                            "_copyZerobufArray( value.data(), value.size() * sizeof( " +
-                                            self.value_type.type + " ), " + str( self.dynamic_type_index ) + " );" ))
-            # string
-            functions.append(Function( "std::string",
-                                            "get" + self.cxxName + "String() const",
-                                            "const uint8_t* ptr = getAllocator().template getDynamic< " +
-                                            "const uint8_t >( " + str( self.dynamic_type_index ) + " );\n" +
-                                            "    return std::string( ptr, ptr + " +
-                                            "getAllocator().template getItem< uint64_t >( " +
-                                            str( self.allocator_offset + 8 ) + " ));" ))
-            functions.append(Function( "void",
-                                            "set" + self.cxxName + "( const std::string& value )",
-                                            "notifyChanging();\n    " +
-                                            "_copyZerobufArray( value.c_str(), value.length(), " +
-                                            str( self.dynamic_type_index ) + " );" ))
-        return functions
+    def setters(self):
+        if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
+            return [self.vector_dynamic_setter()]
+        # Dynamic array of PODs
+        return [self.c_pointer_setter(),
+                self.vector_pod_setter(),
+                self.string_setter()]
+
+    def accessor_functions(self):
+        """Override ClassMember.accessor_functions for legacy ordering of functions"""
+        if self.value_type.is_zerobuf_type: # Dynamic array of (static) Zerobufs
+            return self.getters() + self.setters()
+        # Dynamic array of PODs
+        return [self.ref_getter(self.classname),
+                self.const_ref_getter(self.classname),
+                self.c_pointer_setter(),
+                self.vector_pod_getter(),
+                self.vector_pod_setter(),
+                self.string_getter(),
+                self.string_setter()]
 
     def get_byte_size(self):
         return 16 # 8b offset, 8b size
@@ -463,7 +538,13 @@ class DynamicMember(ClassMember):
         if self.value_type.is_string:
             return "std::string"
         # vector of any type
+        return self.vector_type()
+
+    def vector_type(self):
         return "std::vector< {0} >".format(self.value_type.type)
+
+    def qualified_type(self, classname):
+        return "{0}::{1}".format(classname, self.cxxName)
 
     def get_initializer(self):
         return [self.cxxname, 0, self.cxxName, self.dynamic_type_index, self.value_type.size]
@@ -639,8 +720,8 @@ class FbsTable():
         self.functions.append(Function( None,
                                         "{0}( {1} )".format(self.name, ', '.join(memberArgs)),
                                         allocator_init +
-                                        "{\n    " +
-                                        "\n    ".join(setters) +
+                                        "{" + NEXTLINE +
+                                        NEXTLINE.join(setters) +
                                         "\n}"))
 
         # copy ctor
@@ -755,9 +836,9 @@ class FbsTable():
             if member.value_type.is_zerobuf_type:
                 member_declarations.append(member.get_declaration())
 
-        file.write( "private:\n    ")
-        file.write( '\n    '.join(member_declarations))
-        file.write( "\n};\n\n" )
+        file.write("private:" + NEXTLINE)
+        file.write(NEXTLINE.join(member_declarations))
+        file.write("\n};\n\n")
 
     def write_implementation(self, file):
         # members accessors
